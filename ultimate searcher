@@ -1,0 +1,203 @@
+import re
+import socket
+import smtplib
+import requests
+import dns.resolver
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse
+
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+}
+EMAIL_RE = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
+
+# ---------- 1. Scrape ----------
+def extract_emails_from_page(url):
+    emails, links = set(), set()
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        if r.status_code == 403: return emails, links
+        r.raise_for_status()
+        
+        for m in EMAIL_RE.findall(r.text):
+            emails.add(m.lower())
+
+        soup = BeautifulSoup(r.text, 'html.parser')
+        for a in soup.find_all('a', href=True):
+            href = a['href']
+            if href.lower().startswith('mailto:'):
+                em = href[7:].split('?')[0].strip()
+                if '@' in em: emails.add(em.lower())
+            elif href.startswith('/') or urlparse(href).netloc == urlparse(url).netloc:
+                links.add(urljoin(url, href).split('#')[0])
+
+        for m in EMAIL_RE.findall(soup.get_text()):
+            emails.add(m.lower())
+    except Exception:
+        pass
+
+    clean = {e for e in emails if not e.endswith(('.png', '.jpg', '.gif', '.css', '.js', '.webp'))}
+    return clean, links
+
+def crawl_site(start_url, max_pages=15):
+    domain = urlparse(start_url).netloc
+    visited, queue, all_emails = set(), [start_url], set()
+    print(f"\n🌐 Crawling {domain} (max {max_pages} pages)\n")
+    while queue and len(visited) < max_pages:
+        url = queue.pop(0)
+        if url in visited: continue
+        visited.add(url)
+        emails, links = extract_emails_from_page(url)
+        if emails: print(f"  ✅ [{len(emails)}] {url}")
+        for link in links:
+            if link not in visited and urlparse(link).netloc == domain:
+                queue.append(link)
+        all_emails.update(emails)
+    return all_emails
+
+# ---------- 2. Verification ----------
+def get_mx_host(domain):
+    try:
+        resolver = dns.resolver.Resolver(configure=False)
+        resolver.nameservers = ['1.1.1.1', '8.8.8.8']
+        answers = resolver.resolve(domain, 'MX', lifetime=10)
+        mx = sorted(answers, key=lambda r: r.preference)[0]
+        return str(mx.exchange).rstrip('.')
+    except Exception:
+        if domain in ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com']:
+            return "known_good_provider"
+        return None
+
+def smtp_verify(email, mx_host, timeout=8):
+    if mx_host == "known_good_provider": return None 
+    try:
+        with smtplib.SMTP(mx_host, 25, timeout=timeout) as s:
+            s.helo(socket.gethostname())
+            s.mail('verify@example.com')
+            code, _ = s.rcpt(email)
+            return code in (250, 251)
+    except Exception:
+        return None
+
+def verify_email(email):
+    domain = email.split('@')[1]
+    mx = get_mx_host(domain)
+    if not mx: return "bad", "no MX record"
+    
+    res = smtp_verify(email, mx)
+    if res is True: return "good", "SMTP accepted"
+    if res is False: return "bad", "SMTP rejected"
+    return "good", "MX ok (SMTP unknown)"
+
+# ---------- 3. MAIN ----------
+def main():
+    print("=" * 58)
+    print("  📧  SMART COMBO EXTRACTOR & CHECKER (v5)")
+    print("=" * 58)
+
+    url = input("\nEnter the website URL: ").strip()
+    if not url.startswith(('http://', 'https://')): url = 'https://' + url
+
+    print("\nPaste your MESSY list (URLs, emails, phones, etc).")
+    print("The script will automatically find the emails. Type DONE when finished.\n")
+    
+    user_data = {} 
+    
+    while True:
+        try:
+            line = input().strip()
+        except EOFError:
+            break
+        if line.upper() == "DONE":
+            break
+        
+        # THE FIX: Search the entire line for an email address using Regex
+        match = re.search(EMAIL_RE, line)
+        
+        if match:
+            email = match.group(0).lower()
+            # Everything after the email address is assumed to be the password
+            remainder = line[match.end():].strip()
+            
+            # Clean up the leading colon (e.g. ":Password123")
+            if remainder.startswith(':'):
+                password = remainder[1:].strip()
+            else:
+                password = remainder.strip()
+                
+            if not password:
+                password = "NO_PASSWORD"
+                
+            user_data[email] = password
+
+    if not user_data:
+        print("\n❌ No emails found in your text. Make sure they contain '@'.")
+        return
+
+    print(f"\n✅ Successfully extracted {len(user_data)} email(s) from your messy text.")
+
+    crawl_choice = input("\nCrawl internal pages too? (y/n, default y): ").strip().lower()
+    max_pages = 1
+    if crawl_choice != 'n':
+        try: max_pages = int(input("  Max pages (default 15): ") or 15)
+        except ValueError: max_pages = 15
+
+    if max_pages == 1:
+        site_emails, _ = extract_emails_from_page(url)
+    else:
+        site_emails = crawl_site(url, max_pages=max_pages)
+
+    if len(site_emails) == 0:
+        domain = urlparse(url).netloc.replace('www.', '')
+        print(f"\n🤖 Site blocked. Guessing common emails for @{domain}...")
+        site_emails.update([f"info@{domain}", f"contact@{domain}", f"support@{domain}", f"admin@{domain}"])
+
+    print(f"\n🔍 Verifying {len(user_data)} combos (This takes a moment)...")
+
+    # Separate lists
+    smtp_accepted = []
+    smtp_unknown = []
+    failed = []
+
+    for e, pw in user_data.items():
+        status, reason = verify_email(e)
+        combo = f"{e}:{pw}"
+        
+        if reason == "SMTP accepted":
+            smtp_accepted.append(combo)
+        elif reason == "MX ok (SMTP unknown)":
+            smtp_unknown.append(combo)
+        else:
+            failed.append(f"{combo} [{reason}]")
+
+    # --- PRINT RESULTS ---
+    print("\n" + "=" * 58)
+    print(f"✅ SMTP ACCEPTED COMBOS ({len(smtp_accepted)}):")
+    for combo in smtp_accepted: print(f"   {combo}")
+    if not smtp_accepted: print("   (none)")
+
+    print(f"\n⚪ VALID EMAILS (MX OK, but SMTP blocked by phone network) ({len(smtp_unknown)}):")
+    for combo in smtp_unknown: print(f"   {combo}")
+    if not smtp_unknown: print("   (none)")
+
+    print(f"\n❌ FAILED / INVALID ({len(failed)}):")
+    for combo in failed: print(f"   {combo}")
+    if not failed: print("   (none)")
+
+    # --- SAVE TO FILE ---
+    try:
+        path1 = "/storage/emulated/0/Download/SMTP_Accepted.txt"
+        path2 = "/storage/emulated/0/Download/MX_Valid_Only.txt"
+        
+        with open(path1, "w") as f:
+            f.write("\n".join(smtp_accepted))
+        with open(path2, "w") as f:
+            f.write("\n".join(smtp_unknown))
+            
+        print(f"\n💾 Saved SMTP accepted to: {path1}")
+        print(f"💾 Saved valid emails to: {path2}")
+    except Exception as ex:
+        print(f"\n(Couldn't save file: {ex})")
+
+if __name__ == "__main__":
+    main()
